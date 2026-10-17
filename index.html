@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function () {
+        try {
+          var currentFetch = window.fetch ? window.fetch.bind(window) : undefined;
+          var desc =
+            Object.getOwnPropertyDescriptor(window, 'fetch') ||
+            Object.getOwnPropertyDescriptor(Window.prototype, 'fetch');
+          if (desc && desc.configurable !== false && (!desc.writable && !desc.set)) {
+            Object.defineProperty(window, 'fetch', {
+              configurable: true,
+              enumerable: true,
+              get: function () {
+                return currentFetch;
+              },
+              set: function ( nextFetch ) {
+                if (typeof nextFetch === 'function') {
+                  currentFetch = nextFetch;
+                }
+              },
+            });
+          }
+        } catch (_e) {}
+
+        window.addEventListener(
+          'error',
+          function (event) {
+            var msg = String((event && event.message) || '');
+            var src = String((event && event.filename) || '');
+            if (
+              msg.indexOf('Cannot set property fetch') !== -1 ||
+              src.indexOf('chrome-extension://') === 0 ||
+              src.indexOf('moz-extension://') === 0
+            ) {
+              event.preventDefault();
+              event.stopImmediatePropagation();
+              return false;
+            }
+          },
+          true
+        );
+
+        window.addEventListener(
+          'unhandledrejection',
+          function (event) {
+            var reasonStr = String((event && event.reason) || '');
+            if (
+              reasonStr.indexOf('Cannot set property fetch') !== -1 ||
+              reasonStr.indexOf('chrome-extension://') !== -1
+            ) {
+              event.preventDefault();
+              event.stopImmediatePropagation();
+            }
+          },
+          true
+        );
+      })();
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0" />
+    <title>OpticLink Remote Telemetry & WebRTC Studio</title>
+    <meta name="description" content="Production-grade Dual-Mode WebRTC Remote Camera, Screen Share, and Hardware Telemetry PWA with sub-250ms pre-warmed P2P control channels, anti-blank-screen WebP fallback, and zero-polling Firestore presence." />
+    <meta property="og:title" content="OpticLink Remote Telemetry & WebRTC Studio" />
+    <meta property="og:description" content="Production-grade Dual-Mode WebRTC Remote Camera, Screen Share, and Hardware Telemetry PWA with sub-250ms pre-warmed P2P control channels, anti-blank-screen WebP fallback, and zero-polling Firestore presence." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#0B0F19" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="OpticLink" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
+  </head>
+  <body class="w-full max-w-full overflow-x-hidden antialiased selection:bg-blue-600 selection:text-white">
+    <div id="root" class="w-full max-w-full overflow-x-hidden"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

@@ -1,0 +1,6 @@
+{
+  "name": "OpticLink Remote Telemetry & WebRTC Studio",
+  "description": "Production-grade Dual-Mode WebRTC Remote Camera, Screen Share, and Hardware Telemetry PWA with sub-250ms pre-warmed P2P control channels, anti-blank-screen WebP fallback, and zero-polling Firestore presence.",
+  "requestFramePermissions": ["camera", "display-capture"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

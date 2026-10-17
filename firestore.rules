@@ -1,0 +1,67 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Connection health check endpoint
+    match /test/{docId} {
+      allow get, list: if true;
+      allow write: if false;
+    }
+
+    // Registered Device Agents (Zero-Polling State-Change Presence)
+    match /devices/{deviceId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(deviceId)
+        && request.resource.data.deviceUuid is string
+        && request.resource.data.deviceUuid.size() <= 128
+        && request.resource.data.customName is string
+        && request.resource.data.customName.size() <= 80
+        && request.resource.data.streamState in ['IDLE', 'STREAMING_CAMERA', 'STREAMING_SCREEN', 'STREAMING_DUAL', 'PAUSED'];
+      allow delete: if isValidId(deviceId);
+    }
+
+    // 6-Digit Pairing Codes (5-minute TTL)
+    match /pairings/{code} {
+      allow get, list: if true;
+      allow create, update: if isValidId(code)
+        && request.resource.data.code is string
+        && request.resource.data.code.size() <= 12
+        && request.resource.data.status in ['PENDING', 'CLAIMED', 'EXPIRED'];
+      allow delete: if isValidId(code);
+    }
+
+    // Ephemeral WebRTC SDP / Trickle ICE / On-Demand PING-PONG Signals
+    match /signals/{signalId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(signalId)
+        && request.resource.data.fromId is string
+        && request.resource.data.fromId.size() <= 128
+        && request.resource.data.toId is string
+        && request.resource.data.toId.size() <= 128
+        && request.resource.data.type in ['OFFER', 'ANSWER', 'ICE', 'PING', 'PONG', 'CONTROL']
+        && request.resource.data.payload is string
+        && request.resource.data.payload.size() <= 65536;
+      allow delete: if isValidId(signalId);
+    }
+
+    // Global Security Settings (/settings/global)
+    match /settings/{settingId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(settingId)
+        && request.resource.data.pinHash is string
+        && request.resource.data.pinHash.size() <= 256
+        && request.resource.data.failedAttempts is number
+        && request.resource.data.lockoutUntil is number;
+      allow delete: if isValidId(settingId);
+    }
+  }
+}
