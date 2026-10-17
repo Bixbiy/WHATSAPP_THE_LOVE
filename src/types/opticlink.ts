@@ -1,4 +1,4 @@
-export type AppMode = 'CONTROLLER' | 'AGENT';
+export type AppRole = 'CONTROLLER' | 'NODE';
 
 export type StreamState =
   | 'IDLE'
@@ -53,12 +53,22 @@ export interface CameraLensInfo {
   facing: 'front' | 'back' | 'external';
 }
 
+export interface RemoteNodeCommand {
+  commandId: string;
+  issuedAt: number;
+  action: 'START_CAMERA' | 'START_SCREEN' | 'WARM_PAUSE' | 'STOP_STREAM' | 'PING';
+  facing?: 'front' | 'back';
+  lensId?: string;
+}
+
 export interface DeviceAgentRecord {
   deviceUuid: string;
-  customName: string; // Auto-assigned e.g. "Samsung SM-A54 • Android (#4F9)"
+  customName: string; // e.g. "Samsung SM-A54 • Android (#4F9)"
   locationTag: string;
   hardwareModel: string;
   osVersion: string;
+  online?: boolean;
+  heartbeatAt?: number;
   batteryLevel: number;
   isCharging: boolean;
   networkType: string;
@@ -74,6 +84,7 @@ export interface DeviceAgentRecord {
   qualityTier?: AdaptiveQualityTierId;
   whatsappYielded?: boolean;
   activeFacing?: 'front' | 'back';
+  remoteCommand?: RemoteNodeCommand;
 }
 
 export interface SignalPacket {
@@ -126,23 +137,27 @@ export type P2PControlMessage =
       mode: 'STREAMING_CAMERA' | 'STREAMING_SCREEN';
       lensId?: string;
       facing?: 'front' | 'back';
-      requestId?: string;
+      commandId?: string;
     }
   | {
       type: 'CMD_WARM_PAUSE';
+      commandId?: string;
     }
   | {
       type: 'CMD_STOP_STREAM';
       reason?: string;
+      commandId?: string;
     }
   | {
       type: 'CMD_SWITCH_LENS';
       lensId: string;
       facing?: 'front' | 'back';
+      commandId?: string;
     }
   | {
       type: 'CMD_PING';
       sentAt: number;
+      commandId?: string;
     }
   | {
       type: 'EVT_PONG';
@@ -168,6 +183,7 @@ export type P2PControlMessage =
 
 declare global {
   interface Window {
+    Capacitor?: unknown;
     AndroidBridge?: {
       openWhatsApp?: () => void;
     };

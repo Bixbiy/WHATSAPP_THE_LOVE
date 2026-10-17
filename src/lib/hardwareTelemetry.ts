@@ -1,4 +1,4 @@
-import { AppMode, CameraLensInfo, StreamState } from '../types/opticlink';
+import { AppRole, CameraLensInfo, StreamState } from '../types/opticlink';
 
 export interface ParsedHardwareIdentity {
   hardwareModel: string;
@@ -6,27 +6,37 @@ export interface ParsedHardwareIdentity {
   browserLabel: string;
 }
 
-export function detectDefaultAppMode(): AppMode {
+export function detectDefaultAppRole(): AppRole {
   if (typeof window === 'undefined') return 'CONTROLLER';
+
+  const params = new URLSearchParams(window.location.search);
+  const roleParam = (params.get('role') || '').toLowerCase();
+  if (roleParam === 'node' || roleParam === 'agent') return 'NODE';
+  if (roleParam === 'controller' || roleParam === 'dashboard') return 'CONTROLLER';
+
+  const hasCapacitor = Boolean((window as unknown as { Capacitor?: unknown }).Capacitor);
+  const hasAndroidBridge = Boolean(window.AndroidBridge);
   const ua = navigator.userAgent || '';
   const isMobileUA = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
-  const isSmallScreen = window.innerWidth <= 768;
-  const hasAndroidBridge = Boolean(window.AndroidBridge);
-  return isMobileUA || isSmallScreen || hasAndroidBridge ? 'AGENT' : 'CONTROLLER';
+  const isSmallScreen = window.innerWidth < 768;
+
+  return hasCapacitor || hasAndroidBridge || isMobileUA || isSmallScreen
+    ? 'NODE'
+    : 'CONTROLLER';
 }
 
 export function parseHardwareAndOS(): ParsedHardwareIdentity {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
-  let osVersion = 'Web OS';
-  let hardwareModel = 'Device';
+  let osVersion = 'Android';
+  let hardwareModel = 'Mobile Node';
 
   if (/Android\s+([0-9.]+)/i.test(ua)) {
     const match = ua.match(/Android\s+([0-9.]+)/i);
     osVersion = `Android ${match?.[1] || ''}`.trim();
     const modelMatch =
       ua.match(/;\s*([^;)]+)\s+Build\//i) || ua.match(/Android[^;]+;\s*([^)]+)\)/i);
-    const rawModel = modelMatch?.[1]?.trim() || 'Android Phone';
-    hardwareModel = rawModel.replace(/^wv$/i, 'Android Phone');
+    const rawModel = modelMatch?.[1]?.trim() || 'Android Node';
+    hardwareModel = rawModel.replace(/^wv$/i, 'Android Node');
   } else if (/iPhone|iPad|iPod/i.test(ua)) {
     const osMatch = ua.match(/OS\s+([0-9_]+)/i);
     const ver = osMatch?.[1]?.replace(/_/g, '.') || '';
@@ -34,16 +44,16 @@ export function parseHardwareAndOS(): ParsedHardwareIdentity {
     hardwareModel = /iPad/i.test(ua) ? 'Apple iPad' : 'Apple iPhone';
   } else if (/Mac OS X\s+([0-9_]+)/i.test(ua)) {
     osVersion = 'macOS';
-    hardwareModel = 'Mac';
+    hardwareModel = 'Mac Node';
   } else if (/Windows NT\s+([0-9.]+)/i.test(ua)) {
     osVersion = 'Windows';
-    hardwareModel = 'PC';
+    hardwareModel = 'PC Node';
   } else if (/Linux/i.test(ua)) {
-    osVersion = 'Android / Linux';
-    hardwareModel = 'Mobile Unit';
+    osVersion = 'Android';
+    hardwareModel = 'Android Node';
   }
 
-  let browserName = 'Browser';
+  let browserName = 'WebView';
   if (/Edg\//i.test(ua)) browserName = 'Edge';
   else if (/Chrome\//i.test(ua)) browserName = 'Chrome';
   else if (/Safari\//i.test(ua) && !/Chrome/i.test(ua)) browserName = 'Safari';
@@ -56,7 +66,7 @@ export function parseHardwareAndOS(): ParsedHardwareIdentity {
   };
 }
 
-// Generates a persistent deviceId and automatic name e.g. "Samsung SM-A54 • Android (#4F9)"
+// Immediately generates or loads a persistent deviceId from localStorage and detects model from navigator.userAgent
 export function getOrCreateAutoDeviceIdentity(): {
   deviceId: string;
   autoAssignedName: string;
@@ -78,7 +88,7 @@ export function getOrCreateAutoDeviceIdentity(): {
   }
 
   if (!deviceId) {
-    deviceId = `phone-${shortHex.toLowerCase()}-${Math.random().toString(36).substring(2, 8)}`;
+    deviceId = `node-${shortHex.toLowerCase()}-${Math.random().toString(36).substring(2, 8)}`;
     localStorage.setItem(STORAGE_ID_KEY, deviceId);
   }
 
@@ -125,7 +135,7 @@ export async function subscribeToBatteryChanges(
   };
 
   if (!nav.getBattery) {
-    onUpdate(96, false);
+    onUpdate(96, true);
     return () => {};
   }
 
@@ -142,7 +152,7 @@ export async function subscribeToBatteryChanges(
       battery.removeEventListener('chargingchange', emit);
     };
   } catch {
-    onUpdate(96, false);
+    onUpdate(96, true);
     return () => {};
   }
 }
@@ -214,7 +224,7 @@ export async function releaseHardwareMediaZeroHold(options: {
   rtpSender?: RTCRtpSender | null;
   waitForSettleMs?: number;
 }): Promise<void> {
-  const { stream, videoElement, rtpSender, waitForSettleMs = 200 } = options;
+  const { stream, videoElement, rtpSender, waitForSettleMs = 150 } = options;
 
   if (rtpSender) {
     try {
@@ -250,7 +260,8 @@ let keepAliveOsc: OscillatorNode | null = null;
 export function startSilentAudioKeepAlive(): void {
   try {
     const AudioContextClass =
-      window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     if (!AudioContextClass) return;
 
     if (!keepAliveAudioCtx) {
@@ -272,24 +283,6 @@ export function startSilentAudioKeepAlive(): void {
     }
   } catch {
     // Ignore audio context restriction
-  }
-}
-
-// Launch WhatsApp via AndroidBridge or Android intent / whatsapp:// URI scheme
-export function launchWhatsAppApp(mode: 'intent' | 'scheme' = 'intent'): void {
-  try {
-    if (window.AndroidBridge?.openWhatsApp) {
-      window.AndroidBridge.openWhatsApp();
-      return;
-    }
-    if (mode === 'scheme') {
-      window.location.href = 'whatsapp://send';
-    } else {
-      window.location.href =
-        'intent://send#Intent;package=com.whatsapp;scheme=whatsapp;end';
-    }
-  } catch {
-    // Ignore navigation error on desktop browsers
   }
 }
 

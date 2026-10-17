@@ -1,19 +1,23 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  Activity,
   Battery,
   BatteryCharging,
-  CheckCircle2,
+  Cpu,
   EyeOff,
-  MessageCircle,
-  Settings,
-  ShieldCheck,
+  Radio,
+  Square,
+  Wifi,
 } from 'lucide-react';
-import { upsertDeviceStateChange } from '../lib/firebase';
+import {
+  sendNodeHeartbeat,
+  subscribeToSingleDeviceNode,
+  upsertDeviceStateChange,
+} from '../lib/firebase';
 import {
   enumerateCameraLenses,
   getNetworkConnectionType,
   getOrCreateAutoDeviceIdentity,
-  launchWhatsAppApp,
   releaseHardwareMediaZeroHold,
   start24HourIdleRefreshWatchdog,
   startSilentAudioKeepAlive,
@@ -21,13 +25,8 @@ import {
   subscribeToNetworkChanges,
 } from '../lib/hardwareTelemetry';
 import {
-  emitLocalControlMessage,
-  onLocalControlMessage,
-  publishLocalMediaStream,
-} from '../lib/loopbackBus';
-import {
   AntiBlankScreenWatchdog,
-  PreWarmedMultiplexPeer,
+  WebRTCManager,
   applyAdaptiveTierToStream,
   computeAdaptiveQualityTier,
   createDiagnosticOpticalStream,
@@ -38,34 +37,25 @@ import {
   CameraLensInfo,
   DeviceAgentRecord,
   P2PControlMessage,
+  RemoteNodeCommand,
   StreamState,
   TransportEngine,
 } from '../types/opticlink';
 
-const STORAGE_SETUP_COMPLETED_KEY = 'setupCompleted';
-const STORAGE_AUTO_REDIRECT_KEY = 'opticlink_auto_whatsapp_redirect_v1';
+interface DeviceAgentViewProps {
+  onSwitchToController?: () => void;
+}
 
-export const DeviceAgentView: React.FC = () => {
+export const DeviceAgentView: React.FC<DeviceAgentViewProps> = ({
+  onSwitchToController,
+}) => {
   const autoIdentity = useRef(getOrCreateAutoDeviceIdentity()).current;
   const bootedAtRef = useRef<number>(Date.now());
-
-  const [setupCompleted, setSetupCompleted] = useState<boolean>(() => {
-    return localStorage.getItem(STORAGE_SETUP_COMPLETED_KEY) === 'true';
-  });
-
-  const [autoRedirectEnabled, setAutoRedirectEnabled] = useState<boolean>(() => {
-    const saved = localStorage.getItem(STORAGE_AUTO_REDIRECT_KEY);
-    return saved ? saved === 'true' : true;
-  });
-
-  const [inSplashRedirectWindow, setInSplashRedirectWindow] = useState<boolean>(() => {
-    return localStorage.getItem(STORAGE_SETUP_COMPLETED_KEY) === 'true';
-  });
-  const [topLeftTapCount, setTopLeftTapCount] = useState<number>(0);
 
   const [batteryLevel, setBatteryLevel] = useState<number>(96);
   const [isCharging, setIsCharging] = useState<boolean>(true);
   const [networkType, setNetworkType] = useState<string>(() => getNetworkConnectionType());
+  const [livePingMs, setLivePingMs] = useState<number>(18);
 
   const [streamState, setStreamState] = useState<StreamState>('IDLE');
   const streamStateRef = useRef<StreamState>('IDLE');
@@ -77,9 +67,8 @@ export const DeviceAgentView: React.FC = () => {
   const [availableLenses, setAvailableLenses] = useState<CameraLensInfo[]>([]);
   const [selectedLensId, setSelectedLensId] = useState<string>('default-back');
   const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
-  const [blackoutOverlay, setBlackoutOverlay] = useState<boolean>(false);
+  const [oledDimmed, setOledDimmed] = useState<boolean>(false);
   const [whatsappYielded, setWhatsappYielded] = useState<boolean>(false);
-  const [setupBusy, setSetupBusy] = useState<boolean>(false);
 
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
@@ -88,18 +77,32 @@ export const DeviceAgentView: React.FC = () => {
 
   const hiddenCameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const hiddenScreenVideoRef = useRef<HTMLVideoElement | null>(null);
-  const peerRef = useRef<PreWarmedMultiplexPeer | null>(null);
+  const peerRef = useRef<WebRTCManager | null>(null);
   const watchdogRef = useRef<AntiBlankScreenWatchdog>(new AntiBlankScreenWatchdog());
   const wakeLockSentinelRef = useRef<{ release: () => Promise<void> } | null>(null);
+  const executedCommandIdsRef = useRef<Set<string>>(new Set());
+
+  const markCommandExecuted = useCallback((cmdId?: string): boolean => {
+    if (!cmdId) return true;
+    if (executedCommandIdsRef.current.has(cmdId)) return false;
+    executedCommandIdsRef.current.add(cmdId);
+    if (executedCommandIdsRef.current.size > 200) {
+      const first = executedCommandIdsRef.current.values().next().value;
+      if (first) executedCommandIdsRef.current.delete(first);
+    }
+    return true;
+  }, []);
 
   const buildDeviceSnapshot = useCallback(
     (overrides?: Partial<DeviceAgentRecord>): DeviceAgentRecord => {
       return {
         deviceUuid: autoIdentity.deviceId,
         customName: autoIdentity.autoAssignedName,
-        locationTag: 'Auto-Registered Phone Agent',
+        locationTag: 'Auto-Discovered Phone Node',
         hardwareModel: autoIdentity.hardwareModel,
         osVersion: autoIdentity.osVersion,
+        online: true,
+        heartbeatAt: Date.now(),
         batteryLevel,
         isCharging,
         networkType,
@@ -109,6 +112,7 @@ export const DeviceAgentView: React.FC = () => {
         wakeLockActive,
         uptimeStartedAt: bootedAtRef.current,
         lastStateChangeAt: Date.now(),
+        lastPingLatencyMs: livePingMs,
         deviceSecretHash: 'auto-registered',
         availableLenses,
         qualityTier,
@@ -124,6 +128,7 @@ export const DeviceAgentView: React.FC = () => {
       networkType,
       activeEngine,
       wakeLockActive,
+      livePingMs,
       availableLenses,
       qualityTier,
       whatsappYielded,
@@ -143,12 +148,8 @@ export const DeviceAgentView: React.FC = () => {
         type: 'EVT_AGENT_TELEMETRY',
         state: snapshot,
       });
-      emitLocalControlMessage(autoIdentity.deviceId, 'controller-main', {
-        type: 'EVT_AGENT_TELEMETRY',
-        state: snapshot,
-      });
     },
-    [buildDeviceSnapshot, autoIdentity.deviceId]
+    [buildDeviceSnapshot]
   );
 
   const enableBackgroundWakeLockAndKeepAlive = useCallback(async () => {
@@ -163,96 +164,16 @@ export const DeviceAgentView: React.FC = () => {
         wakeLockSentinelRef.current = await nav.wakeLock.request('screen');
       }
     } catch {
-      // Ignore if wakeLock blocked
+      // Ignore if wakeLock requires gesture on desktop
     }
     setWakeLockActive(true);
   }, []);
 
-  // Subsequent Launches (setupCompleted === true): 800ms dark splash screen -> Auto-WhatsApp Redirect
-  useEffect(() => {
-    if (!setupCompleted || !inSplashRedirectWindow) return;
-
-    enableBackgroundWakeLockAndKeepAlive();
-
-    if (!autoRedirectEnabled) {
-      setInSplashRedirectWindow(false);
-      return;
-    }
-
-    const timer = window.setTimeout(() => {
-      setInSplashRedirectWindow(false);
-      launchWhatsAppApp('intent');
-    }, 800);
-
-    return () => window.clearTimeout(timer);
-  }, [setupCompleted, inSplashRedirectWindow, autoRedirectEnabled, enableBackgroundWakeLockAndKeepAlive]);
-
-  const handleTopLeftCornerTap = () => {
-    setTopLeftTapCount((prev) => {
-      const next = prev + 1;
-      if (next >= 5) {
-        setInSplashRedirectWindow(false);
-        return 0;
-      }
-      return next;
-    });
-  };
-
-  useEffect(() => {
-    enumerateCameraLenses().then((lenses) => {
-      setAvailableLenses(lenses);
-      if (lenses.length > 0) {
-        setSelectedLensId(lenses[0].deviceId);
-      }
-      upsertDeviceStateChange({
-        ...buildDeviceSnapshot({
-          availableLenses: lenses,
-          streamState: 'IDLE',
-        }),
-      }).catch(() => {});
-    });
-  }, []);
-
-  useEffect(() => {
-    return start24HourIdleRefreshWatchdog(() => streamStateRef.current, bootedAtRef.current);
-  }, []);
-
-  useEffect(() => {
-    let cleanupBattery: (() => void) | null = null;
-    subscribeToBatteryChanges((level, charging) => {
-      setBatteryLevel((prevLevel) => {
-        setIsCharging((prevCharge) => {
-          if (prevLevel !== level || prevCharge !== charging) {
-            upsertDeviceStateChange(
-              buildDeviceSnapshot({ batteryLevel: level, isCharging: charging })
-            ).catch(() => {});
-          }
-          return charging;
-        });
-        return level;
-      });
-    }).then((fn) => {
-      cleanupBattery = fn;
-    });
-
-    const cleanupNet = subscribeToNetworkChanges((net) => {
-      setNetworkType((prev) => {
-        if (prev !== net) {
-          upsertDeviceStateChange(buildDeviceSnapshot({ networkType: net })).catch(() => {});
-          peerRef.current?.triggerIceRestart();
-        }
-        return net;
-      });
-    });
-
-    return () => {
-      cleanupBattery?.();
-      cleanupNet();
-    };
-  }, [buildDeviceSnapshot]);
-
+  // ============================================================================
+  // ZERO-HOLD HARDWARE CAMERA RELEASE (100% Free for Phone Calls & WhatsApp)
+  // ============================================================================
   const stopAllHardwareStreams = useCallback(
-    async (targetNextState: StreamState = 'IDLE', yieldedToWhatsApp = false) => {
+    async (targetNextState: StreamState = 'IDLE', yieldedToExternalApp = false) => {
       watchdogRef.current.stop();
       stopSyntheticCamRef.current?.();
       stopSyntheticCamRef.current = null;
@@ -266,10 +187,9 @@ export const DeviceAgentView: React.FC = () => {
         stream: cameraStreamRef.current,
         videoElement: hiddenCameraVideoRef.current,
         rtpSender: peerRef.current?.getCameraSender() || null,
-        waitForSettleMs: 180,
+        waitForSettleMs: 120,
       });
       cameraStreamRef.current = null;
-      publishLocalMediaStream(autoIdentity.deviceId, 'camera', null);
 
       await releaseHardwareMediaZeroHold({
         stream: screenStreamRef.current,
@@ -278,23 +198,24 @@ export const DeviceAgentView: React.FC = () => {
         waitForSettleMs: 50,
       });
       screenStreamRef.current = null;
-      publishLocalMediaStream(autoIdentity.deviceId, 'screen', null);
 
       setStreamState(targetNextState);
       streamStateRef.current = targetNextState;
-      setWhatsappYielded(yieldedToWhatsApp);
+      setWhatsappYielded(yieldedToExternalApp);
       setActiveEngine('RTP');
 
       await pushStateTransitionToFirestore({
         streamState: targetNextState,
         activeEngine: 'RTP',
-        whatsappYielded: yieldedToWhatsApp,
+        whatsappYielded: yieldedToExternalApp,
       });
     },
-    [autoIdentity.deviceId, qualityTier, pushStateTransitionToFirestore]
+    [qualityTier, pushStateTransitionToFirestore]
   );
 
-  // Progressive 4-stage camera stream acquisition capped at 1280x720 @ 30 FPS
+  // ============================================================================
+  // PROGRESSIVE 4-STAGE 720p @ 30 FPS CAMERA ACQUISITION + ONMUTE YIELD
+  // ============================================================================
   const acquireCameraStream = useCallback(
     async (lensId?: string, facing?: 'front' | 'back') => {
       const targetFacing = facing || activeFacing || 'back';
@@ -307,7 +228,7 @@ export const DeviceAgentView: React.FC = () => {
           stream: cameraStreamRef.current,
           videoElement: hiddenCameraVideoRef.current,
           rtpSender: peerRef.current?.getCameraSender() || null,
-          waitForSettleMs: 150,
+          waitForSettleMs: 120,
         });
         cameraStreamRef.current = null;
       }
@@ -321,7 +242,6 @@ export const DeviceAgentView: React.FC = () => {
         !lensId.startsWith('default-') &&
         availableLenses.some((l) => l.deviceId === lensId);
 
-      // Stage 1: Exact deviceId or exact facingMode with 720p @ 30 FPS cap
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
@@ -340,7 +260,6 @@ export const DeviceAgentView: React.FC = () => {
               },
         });
       } catch {
-        // Stage 2: Ideal facingMode with 720p @ 30 FPS cap
         try {
           stream = await navigator.mediaDevices.getUserMedia({
             audio: false,
@@ -352,14 +271,12 @@ export const DeviceAgentView: React.FC = () => {
             },
           });
         } catch {
-          // Stage 3: Unconstrained physical camera fallback
           try {
             stream = await navigator.mediaDevices.getUserMedia({
               audio: false,
               video: true,
             });
           } catch {
-            // Stage 4: Diagnostic stream if device has no physical camera
             const label = targetFacing === 'front' ? 'Front Camera' : 'Back Camera';
             const diag = createDiagnosticOpticalStream(
               tierSpec.width,
@@ -384,7 +301,6 @@ export const DeviceAgentView: React.FC = () => {
       if (videoEl && stream) {
         videoEl.srcObject = stream;
         await videoEl.play().catch(() => {});
-        // Wait up to 350ms for first camera frame so WebP fallback never captures a blank frame
         if (videoEl.readyState < 2 || videoEl.videoWidth === 0) {
           await new Promise<void>((resolve) => {
             const timeout = window.setTimeout(resolve, 350);
@@ -400,7 +316,10 @@ export const DeviceAgentView: React.FC = () => {
 
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) {
-        // Note: on mobile Android/iOS, camera tracks only fire onended when OS revokes camera
+        // Cleanly pause and release camera if WhatsApp or another phone app claims the camera
+        videoTrack.onmute = () => {
+          stopAllHardwareStreams('PAUSED', true);
+        };
         videoTrack.onended = () => {
           stopAllHardwareStreams('PAUSED', true);
         };
@@ -411,7 +330,6 @@ export const DeviceAgentView: React.FC = () => {
         );
       }
 
-      publishLocalMediaStream(autoIdentity.deviceId, 'camera', stream);
       return stream;
     },
     [qualityTier, availableLenses, activeFacing, autoIdentity, stopAllHardwareStreams]
@@ -462,7 +380,6 @@ export const DeviceAgentView: React.FC = () => {
       );
     }
 
-    publishLocalMediaStream(autoIdentity.deviceId, 'screen', stream);
     return stream;
   }, [qualityTier, autoIdentity, stopAllHardwareStreams]);
 
@@ -523,7 +440,6 @@ export const DeviceAgentView: React.FC = () => {
             timestamp: Date.now(),
           };
           peerRef.current?.sendControlMessage(frameMsg);
-          emitLocalControlMessage(autoIdentity.deviceId, 'controller-main', frameMsg);
         },
       });
 
@@ -541,11 +457,12 @@ export const DeviceAgentView: React.FC = () => {
       acquireScreenStream,
       qualityTier,
       pushStateTransitionToFirestore,
-      autoIdentity.deviceId,
     ]
   );
 
-  // Dynamic 720p @ 30 FPS Controller (Runs every 3 seconds while streaming)
+  // ============================================================================
+  // DYNAMIC 720p @ 30 FPS QUALITY CONTROLLER (Runs Every 3 Seconds)
+  // ============================================================================
   useEffect(() => {
     if (streamState !== 'STREAMING_CAMERA' && streamState !== 'STREAMING_SCREEN') {
       return;
@@ -553,9 +470,11 @@ export const DeviceAgentView: React.FC = () => {
 
     const interval = window.setInterval(async () => {
       const metrics = peerRef.current?.getNetworkMetrics() || {
-        rttMs: 28,
+        rttMs: livePingMs,
         packetLossPct: 0,
       };
+      setLivePingMs(metrics.rttMs);
+
       const nextTier = computeAdaptiveQualityTier({
         rttMs: metrics.rttMs,
         packetLossPct: metrics.packetLossPct,
@@ -582,38 +501,40 @@ export const DeviceAgentView: React.FC = () => {
     }, 3000);
 
     return () => window.clearInterval(interval);
-  }, [streamState, batteryLevel, isCharging, pushStateTransitionToFirestore]);
+  }, [streamState, batteryLevel, isCharging, livePingMs, pushStateTransitionToFirestore]);
 
   const handleControlMessage = useCallback(
     async (msg: P2PControlMessage) => {
       switch (msg.type) {
         case 'CMD_START_STREAM':
+          if (!markCommandExecuted(msg.commandId)) return;
           await handleStartStreamMode(msg.mode, msg.lensId, msg.facing);
           break;
         case 'CMD_WARM_PAUSE':
+          if (!markCommandExecuted(msg.commandId)) return;
           await stopAllHardwareStreams('PAUSED', false);
           break;
         case 'CMD_STOP_STREAM':
+          if (!markCommandExecuted(msg.commandId)) return;
           await stopAllHardwareStreams('IDLE', false);
           break;
         case 'CMD_SWITCH_LENS':
+          if (!markCommandExecuted(msg.commandId)) return;
           setSelectedLensId(msg.lensId);
           if (msg.facing) setActiveFacing(msg.facing);
-          if (streamStateRef.current === 'STREAMING_CAMERA') {
-            await acquireCameraStream(msg.lensId, msg.facing);
-          } else {
-            await handleStartStreamMode('STREAMING_CAMERA', msg.lensId, msg.facing);
-          }
+          await handleStartStreamMode('STREAMING_CAMERA', msg.lensId, msg.facing);
           break;
         case 'CMD_PING': {
+          if (!markCommandExecuted(msg.commandId)) return;
+          const rtt = Math.max(4, Date.now() - msg.sentAt);
+          setLivePingMs(rtt);
           const pong: P2PControlMessage = {
             type: 'EVT_PONG',
             sentAt: msg.sentAt,
-            agentState: buildDeviceSnapshot(),
+            agentState: buildDeviceSnapshot({ lastPingLatencyMs: rtt }),
           };
           peerRef.current?.sendControlMessage(pong);
-          emitLocalControlMessage(autoIdentity.deviceId, 'controller-main', pong);
-          await pushStateTransitionToFirestore();
+          await pushStateTransitionToFirestore({ lastPingLatencyMs: rtt });
           break;
         }
         default:
@@ -621,11 +542,52 @@ export const DeviceAgentView: React.FC = () => {
       }
     },
     [
+      markCommandExecuted,
       handleStartStreamMode,
       stopAllHardwareStreams,
-      acquireCameraStream,
       buildDeviceSnapshot,
-      autoIdentity.deviceId,
+      pushStateTransitionToFirestore,
+    ]
+  );
+
+  const handleDirectFirestoreCommand = useCallback(
+    async (cmd: RemoteNodeCommand) => {
+      if (!cmd || !cmd.commandId) return;
+      // Ignore stale commands older than 30 seconds
+      if (Date.now() - cmd.issuedAt > 30000) return;
+      if (!markCommandExecuted(cmd.commandId)) return;
+
+      switch (cmd.action) {
+        case 'START_CAMERA':
+          await handleStartStreamMode('STREAMING_CAMERA', cmd.lensId, cmd.facing);
+          break;
+        case 'START_SCREEN':
+          await handleStartStreamMode('STREAMING_SCREEN');
+          break;
+        case 'WARM_PAUSE':
+          await stopAllHardwareStreams('PAUSED', false);
+          break;
+        case 'STOP_STREAM':
+          await stopAllHardwareStreams('IDLE', false);
+          break;
+        case 'PING': {
+          const rtt = Math.max(6, Date.now() - cmd.issuedAt);
+          setLivePingMs(rtt);
+          peerRef.current?.sendControlMessage({
+            type: 'EVT_PONG',
+            sentAt: cmd.issuedAt,
+            agentState: buildDeviceSnapshot({ lastPingLatencyMs: rtt }),
+          });
+          await pushStateTransitionToFirestore({ lastPingLatencyMs: rtt });
+          break;
+        }
+      }
+    },
+    [
+      markCommandExecuted,
+      handleStartStreamMode,
+      stopAllHardwareStreams,
+      buildDeviceSnapshot,
       pushStateTransitionToFirestore,
     ]
   );
@@ -633,8 +595,54 @@ export const DeviceAgentView: React.FC = () => {
   const handleControlMessageRef = useRef(handleControlMessage);
   handleControlMessageRef.current = handleControlMessage;
 
+  const handleDirectCommandRef = useRef(handleDirectFirestoreCommand);
+  handleDirectCommandRef.current = handleDirectFirestoreCommand;
+
+  // ============================================================================
+  // ZERO-CLICK AUTO-BOOT ON MOUNT (Immediate Registration + 15s Heartbeat + WebRTC)
+  // ============================================================================
   useEffect(() => {
-    const peer = new PreWarmedMultiplexPeer({
+    enableBackgroundWakeLockAndKeepAlive();
+
+    // 1. Immediately register node as online: true and enumerate camera lenses
+    enumerateCameraLenses().then((lenses) => {
+      setAvailableLenses(lenses);
+      if (lenses.length > 0) {
+        setSelectedLensId(lenses[0].deviceId);
+      }
+      upsertDeviceStateChange({
+        ...buildDeviceSnapshot({
+          online: true,
+          heartbeatAt: Date.now(),
+          availableLenses: lenses,
+          streamState: 'IDLE',
+        }),
+      }).catch(() => {});
+    });
+
+    // 2. Start 15-second live Firestore heartbeat
+    const heartbeatTimer = window.setInterval(() => {
+      sendNodeHeartbeat(autoIdentity.deviceId, {
+        customName: autoIdentity.autoAssignedName,
+        hardwareModel: autoIdentity.hardwareModel,
+        osVersion: autoIdentity.osVersion,
+        batteryLevel,
+        isCharging,
+        networkType,
+        streamState: streamStateRef.current,
+        lastPingLatencyMs: livePingMs,
+      }).catch(() => {});
+    }, 15000);
+
+    // 3. Attach instant Firestore onSnapshot command listener for this node
+    const unsubNodeDoc = subscribeToSingleDeviceNode(autoIdentity.deviceId, (docData) => {
+      if (docData.remoteCommand) {
+        handleDirectCommandRef.current(docData.remoteCommand);
+      }
+    });
+
+    // 4. Pre-warm WebRTCManager (10-candidate ICE pool + 'control-plane' DataChannel)
+    const peer = new WebRTCManager({
       localId: autoIdentity.deviceId,
       remoteId: 'controller-main',
       polite: true,
@@ -642,65 +650,68 @@ export const DeviceAgentView: React.FC = () => {
         onControlMessage: (msg) => {
           handleControlMessageRef.current(msg);
         },
+        onTelemetryUpdate: (snap) => {
+          if (snap.pingMs > 0) {
+            setLivePingMs(snap.pingMs);
+          }
+        },
       },
     });
     peerRef.current = peer;
 
-    const unsubLocal = onLocalControlMessage((_fromId, toId, msg) => {
-      if (toId === autoIdentity.deviceId || toId === '*') {
-        handleControlMessageRef.current(msg);
-      }
-    });
-
     return () => {
-      unsubLocal();
+      window.clearInterval(heartbeatTimer);
+      unsubNodeDoc();
       peer.destroy();
       peerRef.current = null;
     };
   }, [autoIdentity.deviceId]);
 
-  const handleOneTimeSetupAndRedirect = async () => {
-    setSetupBusy(true);
-    try {
-      try {
-        const tempStream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: false,
+  useEffect(() => {
+    return start24HourIdleRefreshWatchdog(() => streamStateRef.current, bootedAtRef.current);
+  }, []);
+
+  useEffect(() => {
+    let cleanupBattery: (() => void) | null = null;
+    subscribeToBatteryChanges((level, charging) => {
+      setBatteryLevel((prevLevel) => {
+        setIsCharging((prevCharge) => {
+          if (prevLevel !== level || prevCharge !== charging) {
+            upsertDeviceStateChange(
+              buildDeviceSnapshot({ batteryLevel: level, isCharging: charging })
+            ).catch(() => {});
+          }
+          return charging;
         });
-        tempStream.getTracks().forEach((t) => t.stop());
-      } catch {
-        // Ignore if no camera in sandbox
-      }
-
-      const lenses = await enumerateCameraLenses();
-      setAvailableLenses(lenses);
-
-      await enableBackgroundWakeLockAndKeepAlive();
-
-      localStorage.setItem(STORAGE_SETUP_COMPLETED_KEY, 'true');
-      setSetupCompleted(true);
-
-      await pushStateTransitionToFirestore({
-        streamState: 'IDLE',
-        wakeLockActive: true,
-        availableLenses: lenses,
+        return level;
       });
+    }).then((fn) => {
+      cleanupBattery = fn;
+    });
 
-      launchWhatsAppApp('intent');
-    } finally {
-      setSetupBusy(false);
-    }
-  };
+    const cleanupNet = subscribeToNetworkChanges((net) => {
+      setNetworkType((prev) => {
+        if (prev !== net) {
+          upsertDeviceStateChange(buildDeviceSnapshot({ networkType: net })).catch(() => {});
+          peerRef.current?.triggerIceRestart();
+        }
+        return net;
+      });
+    });
 
-  const toggleAutoRedirect = () => {
-    const next = !autoRedirectEnabled;
-    setAutoRedirectEnabled(next);
-    localStorage.setItem(STORAGE_AUTO_REDIRECT_KEY, String(next));
-  };
+    return () => {
+      cleanupBattery?.();
+      cleanupNet();
+    };
+  }, [buildDeviceSnapshot]);
+
+  const isStreaming =
+    streamState === 'STREAMING_CAMERA' || streamState === 'STREAMING_SCREEN';
+  const tierSpec = ADAPTIVE_QUALITY_TIERS[qualityTier] || ADAPTIVE_QUALITY_TIERS.TIER_720P_30;
 
   return (
-    <div className="w-full max-w-full overflow-x-hidden">
-      {/* Offscreen active video elements (must not be display:none so mobile browsers decode frames) */}
+    <div className="min-h-screen w-full bg-[#090D16] text-slate-100 flex flex-col justify-between p-4 sm:p-6 select-none overflow-x-hidden">
+      {/* Offscreen video capture elements (never display:none so mobile WebView hardware decodes frames) */}
       <video
         ref={hiddenCameraVideoRef}
         muted
@@ -716,150 +727,160 @@ export const DeviceAgentView: React.FC = () => {
         className="fixed -left-[9999px] top-0 w-px h-px opacity-0 pointer-events-none"
       />
 
-      {blackoutOverlay && (
+      {/* Full-Screen #000000 OLED Power Saver Dimmer */}
+      {oledDimmed && (
         <div
-          onClick={() => setBlackoutOverlay(false)}
-          className="fixed inset-0 z-50 bg-[#000000] flex flex-col items-center justify-between p-6 select-none cursor-pointer"
+          onClick={() => setOledDimmed(false)}
+          className="fixed inset-0 z-50 bg-[#000000] flex flex-col items-center justify-between p-6 cursor-pointer"
         >
-          <div className="w-full flex items-center justify-between text-[11px] font-mono text-neutral-700">
-            <span>BLACKOUT MODE ACTIVE</span>
+          <div className="w-full flex items-center justify-between text-[11px] font-mono text-neutral-800">
+            <span>OLED POWER SAVER • NODE ONLINE</span>
             <span>{batteryLevel}%</span>
           </div>
-          <div className="text-xs font-mono text-neutral-700">
-            Tap anywhere to exit Blackout Screen
+          <div className="text-xs font-mono text-neutral-800">
+            Tap anywhere to restore Node HUD
           </div>
         </div>
       )}
 
-      {setupCompleted && inSplashRedirectWindow ? (
-        <div className="fixed inset-0 z-40 bg-[#0B0F19] text-slate-200 flex flex-col justify-between p-6 select-none">
-          <button
-            type="button"
-            onClick={handleTopLeftCornerTap}
-            className="w-44 h-20 text-left flex flex-col justify-start items-start cursor-pointer focus:outline-none"
-          >
-            <span className="text-xs font-mono text-slate-500">
-              Syncing... Tap top-left 5x for Settings
-              {topLeftTapCount > 0 ? ` (${topLeftTapCount}/5)` : ''}
-            </span>
-          </button>
+      {/* Top Node Header */}
+      <header className="w-full max-w-md mx-auto flex items-center justify-between border-b border-slate-800/80 pb-3.5">
+        <div className="flex items-center gap-2">
+          <Radio className="w-4 h-4 text-emerald-400" />
+          <span className="text-sm font-bold tracking-tight text-white font-display">
+            OpticLink Node
+          </span>
+        </div>
+        <span className="text-[11px] font-mono text-emerald-400">
+          AUTO-BOOT ACTIVE
+        </span>
+      </header>
 
-          <div className="my-auto flex flex-col items-center text-center space-y-3">
-            <div className="w-10 h-10 rounded-full border-2 border-emerald-500/40 border-t-emerald-400 animate-spin" />
-            <div className="text-sm font-semibold text-white">
-              {autoIdentity.autoAssignedName}
-            </div>
-            <div className="text-xs text-emerald-400 font-mono">
-              Active & Ready in Background • Launching WhatsApp...
-            </div>
+      {/* Center IoT Hardware Node Telemetry Console */}
+      <main className="w-full max-w-md mx-auto my-auto py-6 space-y-5">
+        {/* Animated Emerald Connection Pulse Banner */}
+        <div className="rounded-2xl border border-emerald-500/30 bg-emerald-950/20 p-5 space-y-3">
+          <div className="flex items-center gap-3">
+            <span className="relative flex h-3.5 w-3.5 shrink-0">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-3.5 w-3.5 bg-emerald-500" />
+            </span>
+            <span className="text-xs sm:text-sm font-mono font-bold tracking-wide text-emerald-400">
+              {isStreaming
+                ? `STREAMING LIVE — ${tierSpec.badgeLabel.replace('•', '@')}`
+                : 'NODE ONLINE • LISTENING FOR CONTROLLER'}
+            </span>
           </div>
 
-          <div className="text-center text-[11px] font-mono text-slate-600">
-            Standby — Camera & Mic 100% Free for WhatsApp/Calls
+          <p className="text-xs text-slate-400 leading-relaxed">
+            {isStreaming
+              ? `Transmitting ${
+                  streamState === 'STREAMING_SCREEN'
+                    ? 'Screen Share'
+                    : activeFacing === 'front'
+                    ? 'Front Camera'
+                    : 'Back Camera'
+                } over Pre-Warmed WebRTC (${tierSpec.maxBitrateKbps} kbps).`
+              : whatsappYielded
+              ? 'Camera yielded cleanly to external call/app. Listening for next Web Controller trigger.'
+              : 'Zero-Hold Standby — Camera & Microphone 100% Free for Phone Calls & WhatsApp.'}
+          </p>
+        </div>
+
+        {/* Device Identity Card */}
+        <div className="rounded-2xl border border-slate-800 bg-[#0F1626] p-4 space-y-2">
+          <div className="flex items-center justify-between text-xs text-slate-400">
+            <span className="flex items-center gap-1.5">
+              <Cpu className="w-3.5 h-3.5 text-blue-400" />
+              <span>Auto-Assigned Node Identity</span>
+            </span>
+            <span className="font-mono text-[11px] text-slate-500">15s Heartbeat</span>
+          </div>
+          <div className="text-base sm:text-lg font-bold text-white break-words">
+            {autoIdentity.autoAssignedName}
+          </div>
+          <div className="text-xs font-mono text-slate-400 break-all">
+            ID: {autoIdentity.deviceId}
           </div>
         </div>
-      ) : (
-        <div className="max-w-md mx-auto my-2 sm:my-6 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4 sm:p-6 space-y-5">
-          <div className="space-y-2">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-xs font-mono text-emerald-600 dark:text-emerald-400 font-semibold flex items-center gap-1.5">
-                <CheckCircle2 className="w-4 h-4 shrink-0" />
-                <span>Active & Ready in Background</span>
-              </span>
-              <span className="text-xs font-mono tabular-nums text-slate-600 dark:text-slate-300 flex items-center gap-1">
-                {isCharging ? (
-                  <BatteryCharging className="w-4 h-4 text-emerald-500" />
-                ) : (
-                  <Battery className="w-4 h-4 text-slate-400" />
-                )}
-                <span>{batteryLevel}%</span>
-              </span>
-            </div>
 
-            <h1 className="text-lg sm:text-xl font-bold text-slate-900 dark:text-white tracking-tight break-words">
-              {autoIdentity.autoAssignedName}
-            </h1>
+        {/* Live Telemetry Grid: Ping (ms), Battery %, Network */}
+        <div className="grid grid-cols-3 gap-2.5">
+          <div className="rounded-xl border border-slate-800 bg-[#0F1626] p-3.5 space-y-1">
+            <div className="flex items-center gap-1 text-[11px] text-slate-400">
+              <Activity className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              <span>Ping</span>
+            </div>
+            <div className="text-sm sm:text-base font-mono font-bold text-white tabular-nums">
+              {livePingMs} ms
+            </div>
           </div>
 
-          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-4 space-y-1.5">
-            <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
-              Current Hardware State
+          <div className="rounded-xl border border-slate-800 bg-[#0F1626] p-3.5 space-y-1">
+            <div className="flex items-center gap-1 text-[11px] text-slate-400">
+              {isCharging ? (
+                <BatteryCharging className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              ) : (
+                <Battery className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              )}
+              <span>Battery</span>
             </div>
-            <div
-              className={`text-sm font-bold ${
-                streamState === 'IDLE' || streamState === 'PAUSED'
-                  ? 'text-slate-900 dark:text-white'
-                  : 'text-emerald-600 dark:text-emerald-400'
-              }`}
+            <div className="text-sm sm:text-base font-mono font-bold text-white tabular-nums">
+              {batteryLevel}%{isCharging ? ' ⚡' : ''}
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-slate-800 bg-[#0F1626] p-3.5 space-y-1">
+            <div className="flex items-center gap-1 text-[11px] text-slate-400">
+              <Wifi className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+              <span>Link</span>
+            </div>
+            <div className="text-sm sm:text-base font-mono font-bold text-white truncate">
+              {networkType}
+            </div>
+          </div>
+        </div>
+
+        {/* Optional OLED Dimmer & Emergency Stop Stream (when active) */}
+        <div className="space-y-2.5 pt-1">
+          {isStreaming && (
+            <button
+              type="button"
+              onClick={() => stopAllHardwareStreams('IDLE', false)}
+              className="w-full min-h-[48px] rounded-xl bg-red-600 hover:bg-red-500 text-white font-bold text-xs sm:text-sm px-4 py-3 flex items-center justify-center gap-2 transition-colors cursor-pointer"
             >
-              {streamState === 'IDLE' || streamState === 'PAUSED'
-                ? 'Standby — Camera & Mic 100% Free for WhatsApp/Calls'
-                : `Streaming Live (${ADAPTIVE_QUALITY_TIERS[qualityTier].badgeLabel})`}
-            </div>
-            <div className="text-xs font-mono text-slate-500 dark:text-slate-400 pt-1">
-              Battery: {batteryLevel}% {isCharging ? '(Charging)' : ''} • Network: {networkType}
-              {whatsappYielded ? ' • Yielded to WhatsApp' : ''}
-            </div>
-          </div>
+              <Square className="w-4 h-4 shrink-0" />
+              <span>Emergency Stop Stream</span>
+            </button>
+          )}
 
           <button
             type="button"
-            disabled={setupBusy}
-            onClick={handleOneTimeSetupAndRedirect}
-            className="w-full min-h-[52px] rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs sm:text-sm px-4 py-3 flex items-center justify-center gap-2 transition-colors cursor-pointer text-center"
+            onClick={() => {
+              enableBackgroundWakeLockAndKeepAlive();
+              setOledDimmed(true);
+            }}
+            className="w-full min-h-[46px] rounded-xl border border-slate-800 bg-[#0F1626] hover:bg-slate-900 text-slate-300 font-semibold text-xs sm:text-sm px-4 py-2.5 flex items-center justify-center gap-2 transition-colors cursor-pointer"
           >
-            <ShieldCheck className="w-5 h-5 shrink-0" />
-            <span>
-              {setupBusy
-                ? 'Locking Permissions...'
-                : setupCompleted
-                ? '1-Time Setup: Lock Permissions & Background Mode'
-                : '1-Time Setup: Grant Camera & Enable Auto-WhatsApp Redirect'}
-            </span>
+            <EyeOff className="w-4 h-4 text-slate-400 shrink-0" />
+            <span>Dim Screen (OLED Power Saver)</span>
           </button>
-
-          <div className="grid grid-cols-2 gap-3">
-            <button
-              type="button"
-              onClick={() => launchWhatsAppApp('scheme')}
-              className="min-h-[48px] rounded-xl bg-slate-900 dark:bg-slate-800 hover:bg-slate-800 dark:hover:bg-slate-700 text-white font-semibold text-xs px-3 py-2.5 flex items-center justify-center gap-2 transition-colors cursor-pointer whitespace-nowrap"
-            >
-              <MessageCircle className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>Open WhatsApp</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                enableBackgroundWakeLockAndKeepAlive();
-                setBlackoutOverlay(true);
-              }}
-              className="min-h-[48px] rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-900 dark:text-slate-200 font-semibold text-xs px-3 py-2.5 flex items-center justify-center gap-2 transition-colors cursor-pointer whitespace-nowrap"
-            >
-              <EyeOff className="w-4 h-4 shrink-0" />
-              <span>Blackout Screen</span>
-            </button>
-          </div>
-
-          <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400">
-              <Settings className="w-3.5 h-3.5 shrink-0" />
-              <span>Auto-WhatsApp Redirect on Launch (800ms)</span>
-            </div>
-            <button
-              type="button"
-              onClick={toggleAutoRedirect}
-              className={`px-3 py-1 rounded-lg text-xs font-mono font-semibold cursor-pointer transition-colors ${
-                autoRedirectEnabled
-                  ? 'bg-emerald-600 text-white'
-                  : 'bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
-              }`}
-            >
-              {autoRedirectEnabled ? 'ON' : 'OFF'}
-            </button>
-          </div>
         </div>
-      )}
+      </main>
+
+      {/* Subtle Footer Role Switch Link */}
+      <footer className="w-full max-w-md mx-auto pt-3 border-t border-slate-900 flex items-center justify-between text-[11px] text-slate-500">
+        <span className="font-mono">720p @ 30 FPS Engine</span>
+        {onSwitchToController && (
+          <button
+            type="button"
+            onClick={onSwitchToController}
+            className="text-slate-400 hover:text-white underline underline-offset-4 cursor-pointer"
+          >
+            Switch to Web Controller
+          </button>
+        )}
+      </footer>
     </div>
   );
 };

@@ -16,6 +16,7 @@ import firebaseConfig from '../../firebase-applet-config.json';
 import {
   DeviceAgentRecord,
   GlobalSecuritySettings,
+  RemoteNodeCommand,
   SignalPacket,
 } from '../types/opticlink';
 
@@ -101,7 +102,7 @@ export function generateSafeId(prefix = 'id'): string {
 }
 
 // ============================================================================
-// ZERO-TOUCH AUTOMATIC DEVICE REGISTRATION & PRESENCE (/devices/{deviceId})
+// ZERO-CLICK AUTOMATIC NODE REGISTRATION, 15s HEARTBEAT & COMMAND LISTENER
 // ============================================================================
 
 export async function upsertDeviceStateChange(
@@ -109,22 +110,91 @@ export async function upsertDeviceStateChange(
 ): Promise<void> {
   const sanitizedId = device.deviceUuid.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120);
   const path = `devices/${sanitizedId}`;
+  const now = Date.now();
   const payload: DeviceAgentRecord = {
     ...device,
     deviceUuid: sanitizedId,
-    customName: (device.customName || 'Phone Agent').slice(0, 80),
-    locationTag: (device.locationTag || 'Auto-Registered').slice(0, 80),
-    hardwareModel: (device.hardwareModel || 'Android Device').slice(0, 120),
+    customName: (device.customName || 'OpticLink Node').slice(0, 80),
+    locationTag: (device.locationTag || 'Auto-Discovered Node').slice(0, 80),
+    hardwareModel: (device.hardwareModel || 'Android Node').slice(0, 120),
     osVersion: (device.osVersion || 'Android').slice(0, 80),
     networkType: (device.networkType || 'Wi-Fi').slice(0, 40),
     deviceSecretHash: (device.deviceSecretHash || 'auto-registered').slice(0, 128),
-    lastStateChangeAt: Date.now(),
+    online: device.online ?? true,
+    heartbeatAt: now,
+    lastStateChangeAt: now,
   };
   try {
     await setDoc(doc(db, 'devices', sanitizedId), payload, { merge: true });
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
+}
+
+export async function sendNodeHeartbeat(
+  deviceUuid: string,
+  patch: Partial<DeviceAgentRecord>
+): Promise<void> {
+  const sanitizedId = deviceUuid.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120);
+  const path = `devices/${sanitizedId}`;
+  const now = Date.now();
+  try {
+    await setDoc(
+      doc(db, 'devices', sanitizedId),
+      {
+        ...patch,
+        deviceUuid: sanitizedId,
+        online: true,
+        heartbeatAt: now,
+        lastStateChangeAt: now,
+      },
+      { merge: true }
+    );
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function dispatchDirectDeviceCommand(
+  device: DeviceAgentRecord,
+  command: RemoteNodeCommand
+): Promise<void> {
+  const sanitizedId = device.deviceUuid.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120);
+  const path = `devices/${sanitizedId}`;
+  try {
+    await setDoc(
+      doc(db, 'devices', sanitizedId),
+      {
+        deviceUuid: sanitizedId,
+        customName: (device.customName || 'OpticLink Node').slice(0, 80),
+        streamState: device.streamState || 'IDLE',
+        remoteCommand: command,
+        lastStateChangeAt: Date.now(),
+      },
+      { merge: true }
+    );
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export function subscribeToSingleDeviceNode(
+  deviceUuid: string,
+  onUpdate: (device: DeviceAgentRecord) => void
+): () => void {
+  const sanitizedId = deviceUuid.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120);
+  const path = `devices/${sanitizedId}`;
+  return onSnapshot(
+    doc(db, 'devices', sanitizedId),
+    (snap) => {
+      if (snap.exists()) {
+        onUpdate(snap.data() as DeviceAgentRecord);
+      }
+    },
+    (error) => {
+      handleFirestoreError(error, OperationType.GET, path);
+    }
+  );
 }
 
 export function subscribeToDevices(
@@ -138,7 +208,7 @@ export function subscribeToDevices(
       snapshot.forEach((docSnap) => {
         list.push(docSnap.data() as DeviceAgentRecord);
       });
-      list.sort((a, b) => b.lastStateChangeAt - a.lastStateChangeAt);
+      list.sort((a, b) => (b.heartbeatAt || b.lastStateChangeAt) - (a.heartbeatAt || a.lastStateChangeAt));
       onUpdate(list);
     },
     (error) => {
@@ -245,7 +315,6 @@ export async function verifyControllerPin(pin: string): Promise<{
   try {
     const settings = await ensureDefaultPinInitialized();
     const candidateHash = await sha256Hex(`${settings.pinSalt}:${pin}`);
-    // Also accept "0000" if settings were still using an older uninitialized record
     if (candidateHash === settings.pinHash) {
       return { unlocked: true };
     }
@@ -281,28 +350,6 @@ export async function changeControllerPin(
       { merge: true }
     );
     return { success: true };
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, path);
-  }
-}
-
-export async function resetControllerPinToDefault(): Promise<void> {
-  const path = 'settings/global';
-  try {
-    const salt = 'default-salt-0000';
-    const pinHash = await sha256Hex(`${salt}:0000`);
-    await setDoc(
-      doc(db, 'settings', 'global'),
-      {
-        pinHash,
-        pinSalt: salt,
-        failedAttempts: 0,
-        lockoutUntil: 0,
-        autoIdleCutoffMinutes: 10,
-        updatedAt: Date.now(),
-      },
-      { merge: true }
-    );
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
